@@ -14,6 +14,8 @@ namespace PAK.SNMP
         private readonly CancellationTokenSource _cancellationTokenSource = new();
         private bool _isTrapListenerActive;
         private Socket? _trapSocket;
+        private readonly Dictionary<string, MibModule> _loadedMibs = new();
+        private readonly MibParser _mibParser = new();
 
         public event EventHandler<SnmpTrapEventArgs>? TrapReceived;
         public event EventHandler<ConnectionStatusEventArgs>? ConnectionStatusChanged;
@@ -240,18 +242,173 @@ namespace PAK.SNMP
             };
         }
 
+        public async Task<IList<SnmpVariable>> GetMultipleAsync(IEnumerable<string> oids, SnmpVersion version, string community = "public")
+        {
+            try
+            {
+                var endpoint = new IPEndPoint(IPAddress.Parse(_host), _port);
+                var variables = oids.Select(oid => new Variable(new ObjectIdentifier(oid))).ToList();
+                
+                var result = await Task.Run(() => Messenger.Get(ToVersionCode(version),
+                    endpoint,
+                    new OctetString(community),
+                    variables,
+                    _timeout));
+                
+                ConnectionStatusChanged?.Invoke(this, new ConnectionStatusEventArgs(true, null));
+                return result.Select(v => new SnmpVariable(v)).ToList();
+            }
+            catch (Exception ex)
+            {
+                ConnectionStatusChanged?.Invoke(this, new ConnectionStatusEventArgs(false, ex.Message));
+                throw new SnmpException($"Failed to get multiple OIDs: {string.Join(", ", oids)}", ex);
+            }
+        }
+
+        public async Task<IList<SnmpVariable>> GetMultipleV3Async(IEnumerable<string> oids, string username, 
+            string authPhrase, string privPhrase,
+            AuthenticationMethod auth = AuthenticationMethod.SHA1,
+            PrivacyMethod priv = PrivacyMethod.AES128)
+        {
+            try
+            {
+                var endpoint = new IPEndPoint(IPAddress.Parse(_host), _port);
+                var privacy = GetPrivacyProvider(priv, authPhrase, privPhrase);
+                var auth_provider = GetAuthenticationProvider(auth, authPhrase);
+                var variables = oids.Select(oid => new Variable(new ObjectIdentifier(oid))).ToList();
+
+                var request = new GetRequestMessage(
+                    Messenger.NextRequestId,
+                    VersionCode.V3,
+                    new OctetString(username),
+                    variables);
+
+                var response = await Task.Run(() => request.GetResponse(_timeout, endpoint));
+                var result = response.Pdu().Variables;
+                
+                ConnectionStatusChanged?.Invoke(this, new ConnectionStatusEventArgs(true, null));
+                return result.Select(v => new SnmpVariable(v)).ToList();
+            }
+            catch (Exception ex)
+            {
+                ConnectionStatusChanged?.Invoke(this, new ConnectionStatusEventArgs(false, ex.Message));
+                throw new SnmpException($"Failed to get multiple OIDs: {string.Join(", ", oids)}", ex);
+            }
+        }
+
+        public async Task<IList<SnmpVariable>> GetBulkAsync(IEnumerable<string> oids, int nonRepeaters, int maxRepetitions, 
+            SnmpVersion version, string community = "public")
+        {
+            if (version == SnmpVersion.V1)
+                throw new SnmpException("GETBULK operation is not supported in SNMP v1");
+
+            try
+            {
+                var endpoint = new IPEndPoint(IPAddress.Parse(_host), _port);
+                var variables = oids.Select(oid => new Variable(new ObjectIdentifier(oid))).ToList();
+                
+                var result = await Task.Run(() => Messenger.GetBulk(variables,
+                    endpoint,
+                    ToVersionCode(version),
+                    nonRepeaters,
+                    maxRepetitions,
+                    new OctetString(community),
+                    _timeout));
+                
+                ConnectionStatusChanged?.Invoke(this, new ConnectionStatusEventArgs(true, null));
+                return result.Select(v => new SnmpVariable(v)).ToList();
+            }
+            catch (Exception ex)
+            {
+                ConnectionStatusChanged?.Invoke(this, new ConnectionStatusEventArgs(false, ex.Message));
+                throw new SnmpException($"Failed to get bulk OIDs: {string.Join(", ", oids)}", ex);
+            }
+        }
+
+        public async Task<IList<SnmpVariable>> GetBulkV3Async(IEnumerable<string> oids, int nonRepeaters, int maxRepetitions,
+            string username, string authPhrase, string privPhrase,
+            AuthenticationMethod auth = AuthenticationMethod.SHA1,
+            PrivacyMethod priv = PrivacyMethod.AES128)
+        {
+            try
+            {
+                var endpoint = new IPEndPoint(IPAddress.Parse(_host), _port);
+                var privacy = GetPrivacyProvider(priv, authPhrase, privPhrase);
+                var auth_provider = GetAuthenticationProvider(auth, authPhrase);
+                var variables = oids.Select(oid => new Variable(new ObjectIdentifier(oid))).ToList();
+
+                var request = new GetBulkRequestMessage(
+                    Messenger.NextRequestId,
+                    VersionCode.V3,
+                    new OctetString(username),
+                    nonRepeaters,
+                    maxRepetitions,
+                    variables);
+
+                var response = await Task.Run(() => request.GetResponse(_timeout, endpoint));
+                var result = response.Pdu().Variables;
+                
+                ConnectionStatusChanged?.Invoke(this, new ConnectionStatusEventArgs(true, null));
+                return result.Select(v => new SnmpVariable(v)).ToList();
+            }
+            catch (Exception ex)
+            {
+                ConnectionStatusChanged?.Invoke(this, new ConnectionStatusEventArgs(false, ex.Message));
+                throw new SnmpException($"Failed to get bulk OIDs: {string.Join(", ", oids)}", ex);
+            }
+        }
+
         public void LoadMibFile(string filePath)
         {
             try
             {
-                // Note: SharpSnmpLib doesn't include direct MIB parsing
-                // For full MIB support, we'd need to implement a custom MIB parser
-                // or use additional libraries
-                throw new NotImplementedException("MIB file parsing is not implemented yet");
+                var modules = _mibParser.Parse(filePath);
+                foreach (var module in modules)
+                {
+                    _loadedMibs[module.Key] = module.Value;
+                }
             }
             catch (Exception ex)
             {
                 throw new SnmpException("Failed to load MIB file", ex);
+            }
+        }
+
+        public MibNode? FindNodeByOid(string oid)
+        {
+            foreach (var module in _loadedMibs.Values)
+            {
+                foreach (var node in module.Nodes.Values)
+                {
+                    if (node.GetFullOid() == oid)
+                        return node;
+                }
+            }
+            return null;
+        }
+
+        public MibNode? FindNodeByName(string name)
+        {
+            foreach (var module in _loadedMibs.Values)
+            {
+                if (module.Nodes.TryGetValue(name, out var node))
+                    return node;
+            }
+            return null;
+        }
+
+        public void PrintMibTree(string moduleName)
+        {
+            if (_loadedMibs.TryGetValue(moduleName, out var module))
+            {
+                foreach (var node in module.Nodes.Values.Where(n => n.Parent == null))
+                {
+                    _mibParser.PrintTree(node);
+                }
+            }
+            else
+            {
+                throw new SnmpException($"MIB module '{moduleName}' not found");
             }
         }
 
