@@ -14,7 +14,7 @@ namespace PAK.SNMP
         private readonly CancellationTokenSource _cancellationTokenSource = new();
         private bool _isTrapListenerActive;
         private Socket? _trapSocket;
-        private readonly Dictionary<string, MibModule> _loadedMibs = new();
+        private readonly List<MibVariable> _loadedVariables = new();
         private readonly MibParser _mibParser = new();
 
         public event EventHandler<SnmpTrapEventArgs>? TrapReceived;
@@ -307,13 +307,16 @@ namespace PAK.SNMP
                 var endpoint = new IPEndPoint(IPAddress.Parse(_host), _port);
                 var variables = oids.Select(oid => new Variable(new ObjectIdentifier(oid))).ToList();
                 
-                var result = await Task.Run(() => Messenger.GetBulk(variables,
-                    endpoint,
+                var request = new GetBulkRequestMessage(
+                    Messenger.NextRequestId,
                     ToVersionCode(version),
+                    new OctetString(community),
                     nonRepeaters,
                     maxRepetitions,
-                    new OctetString(community),
-                    _timeout));
+                    variables);
+
+                var response = await Task.Run(() => request.GetResponse(_timeout, endpoint));
+                var result = response.Pdu().Variables;
                 
                 ConnectionStatusChanged?.Invoke(this, new ConnectionStatusEventArgs(true, null));
                 return result.Select(v => new SnmpVariable(v)).ToList();
@@ -362,11 +365,8 @@ namespace PAK.SNMP
         {
             try
             {
-                var modules = _mibParser.Parse(filePath);
-                foreach (var module in modules)
-                {
-                    _loadedMibs[module.Key] = module.Value;
-                }
+                var variables = _mibParser.ParseFile(filePath);
+                _loadedVariables.AddRange(variables);
             }
             catch (Exception ex)
             {
@@ -374,42 +374,14 @@ namespace PAK.SNMP
             }
         }
 
-        public MibNode? FindNodeByOid(string oid)
+        public MibVariable? FindVariableByOid(string oid)
         {
-            foreach (var module in _loadedMibs.Values)
-            {
-                foreach (var node in module.Nodes.Values)
-                {
-                    if (node.GetFullOid() == oid)
-                        return node;
-                }
-            }
-            return null;
+            return _loadedVariables.FirstOrDefault(v => v.FullOid == oid);
         }
 
-        public MibNode? FindNodeByName(string name)
+        public MibVariable? FindVariableByName(string name)
         {
-            foreach (var module in _loadedMibs.Values)
-            {
-                if (module.Nodes.TryGetValue(name, out var node))
-                    return node;
-            }
-            return null;
-        }
-
-        public void PrintMibTree(string moduleName)
-        {
-            if (_loadedMibs.TryGetValue(moduleName, out var module))
-            {
-                foreach (var node in module.Nodes.Values.Where(n => n.Parent == null))
-                {
-                    _mibParser.PrintTree(node);
-                }
-            }
-            else
-            {
-                throw new SnmpException($"MIB module '{moduleName}' not found");
-            }
+            return _loadedVariables.FirstOrDefault(v => v.Name == name);
         }
 
         public void Dispose()

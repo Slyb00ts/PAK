@@ -1,208 +1,432 @@
-using System.Text.RegularExpressions;
+using System.Text;
 
 namespace PAK.SNMP
 {
-    public class MibNode
+    public class MibVariable
     {
         public string Name { get; set; }
-        public string? Oid { get; set; }
-        public string? Syntax { get; set; }
+        public string FullOid { get; set; }
+        public string Type { get; set; }
         public string? Access { get; set; }
         public string? Status { get; set; }
         public string? Description { get; set; }
-        public Dictionary<string, MibNode> Children { get; } = new();
-        public MibNode? Parent { get; set; }
+        public string? Units { get; set; }
+        public string? DisplayHint { get; set; }
+        public Dictionary<string, string> EnumValues { get; } = new();
 
-        public MibNode(string name)
+        public MibVariable(string name, string fullOid, string type)
         {
             Name = name;
+            FullOid = fullOid;
+            Type = type;
         }
 
-        public string GetFullOid()
+        public override string ToString()
         {
-            if (Parent == null)
-                return Oid ?? Name;
-
-            var parentOid = Parent.GetFullOid();
-            if (string.IsNullOrEmpty(Oid))
-                return parentOid;
-
-            return $"{parentOid}.{Oid}";
-        }
-    }
-
-    public class MibModule
-    {
-        public string Name { get; set; }
-        public List<string> Imports { get; } = new();
-        public Dictionary<string, MibNode> Nodes { get; } = new();
-        public Dictionary<string, string> Types { get; } = new();
-
-        public MibModule(string name)
-        {
-            Name = name;
+            var result = $"{Name} {FullOid} {Type}";
+            if (EnumValues.Count > 0)
+            {
+                result += " {";
+                result += string.Join(", ", EnumValues.Select(kv => $"{kv.Key} ({kv.Value})"));
+                result += "}";
+            }
+            if (!string.IsNullOrEmpty(Description))
+                result += $"\nDescription: {Description}";
+            if (!string.IsNullOrEmpty(Units))
+                result += $"\nUnits: {Units}";
+            if (!string.IsNullOrEmpty(DisplayHint))
+                result += $"\nDisplayHint: {DisplayHint}";
+            return result;
         }
     }
 
     public class MibParser
     {
-        private readonly Dictionary<string, MibModule> _modules = new();
-        private MibModule? _currentModule;
-        private static readonly Regex ModuleRegex = new(@"(\w+)\s+DEFINITIONS\s*::=\s*BEGIN", RegexOptions.Compiled);
-        private static readonly Regex ImportRegex = new(@"IMPORTS\s+(.*?)\s*;", RegexOptions.Compiled | RegexOptions.Singleline);
-        private static readonly Regex ObjectIdentifierRegex = new(@"(\w+)\s+OBJECT\s+IDENTIFIER\s*::=\s*\{\s*([\w\s\.]+)\s*\}", RegexOptions.Compiled);
-        private static readonly Regex ObjectTypeRegex = new(@"(\w+)\s+OBJECT-TYPE\s+SYNTAX\s+([\w\-\(\)\s]+)\s+ACCESS\s+(\w+)\s+STATUS\s+(\w+)\s+DESCRIPTION\s+""([^""]+)""\s*::=\s*\{\s*([\w\s\.]+)\s*\}", RegexOptions.Compiled | RegexOptions.Singleline);
-
-        public Dictionary<string, MibModule> Parse(string filePath)
+        private class MibDefinition
         {
-            var content = File.ReadAllText(filePath);
-            ParseContent(content);
-            BuildNodeHierarchy();
-            return _modules;
+            public string Name { get; set; }
+            public string Parent { get; set; }
+            public string Index { get; set; }
+            public Dictionary<string, string> Attributes { get; } = new();
         }
 
-        private void ParseContent(string content)
+        private readonly Dictionary<string, string> _smiOids = new()
         {
-            // Remove comments
-            content = Regex.Replace(content, "--.*?(\r?\n|$)", "", RegexOptions.Singleline);
+            ["iso"] = "1",
+            ["org"] = "1.3",
+            ["dod"] = "1.3.6",
+            ["internet"] = "1.3.6.1",
+            ["directory"] = "1.3.6.1.1",
+            ["mgmt"] = "1.3.6.1.2",
+            ["mib-2"] = "1.3.6.1.2.1",
+            ["transmission"] = "1.3.6.1.2.1.10",
+            ["experimental"] = "1.3.6.1.3",
+            ["private"] = "1.3.6.1.4",
+            ["enterprises"] = "1.3.6.1.4.1",
+            ["security"] = "1.3.6.1.5",
+            ["snmpV2"] = "1.3.6.1.6"
+        };
 
-            // Parse module definition
-            var moduleMatch = ModuleRegex.Match(content);
-            if (!moduleMatch.Success)
-                throw new MibParseException("Invalid MIB file format: Missing module definition");
-
-            var moduleName = moduleMatch.Groups[1].Value;
-            _currentModule = new MibModule(moduleName);
-            _modules[moduleName] = _currentModule;
-
-            // Parse imports
-            var importMatch = ImportRegex.Match(content);
-            if (importMatch.Success)
-            {
-                var imports = importMatch.Groups[1].Value
-                    .Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries)
-                    .Select(i => i.Trim())
-                    .Where(i => !string.IsNullOrEmpty(i));
-
-                foreach (var import in imports)
-                    _currentModule.Imports.Add(import);
-            }
-
-            // Parse object identifiers
-            foreach (Match match in ObjectIdentifierRegex.Matches(content))
-            {
-                var name = match.Groups[1].Value;
-                var oidPath = match.Groups[2].Value;
-
-                var node = new MibNode(name)
-                {
-                    Oid = oidPath.Trim()
-                };
-
-                _currentModule.Nodes[name] = node;
-            }
-
-            // Parse object types
-            foreach (Match match in ObjectTypeRegex.Matches(content))
-            {
-                var name = match.Groups[1].Value;
-                var syntax = match.Groups[2].Value;
-                var access = match.Groups[3].Value;
-                var status = match.Groups[4].Value;
-                var description = match.Groups[5].Value;
-                var oidPath = match.Groups[6].Value;
-
-                var node = new MibNode(name)
-                {
-                    Oid = oidPath.Trim(),
-                    Syntax = syntax.Trim(),
-                    Access = access,
-                    Status = status,
-                    Description = description.Trim()
-                };
-
-                _currentModule.Nodes[name] = node;
-            }
-        }
-
-        private void BuildNodeHierarchy()
+        private readonly HashSet<string> _wellKnownTypes = new()
         {
-            foreach (var module in _modules.Values)
+            "MODULE-IDENTITY", "OBJECT-TYPE", "NOTIFICATION-TYPE",
+            "OBJECT-GROUP", "NOTIFICATION-GROUP", "MODULE-COMPLIANCE",
+            "TEXTUAL-CONVENTION", "OBJECT IDENTIFIER"
+        };
+
+        public List<MibVariable> ParseString(string content)
+        {
+            var oidMap = new Dictionary<string, string>(_smiOids);
+            var definitions = new Dictionary<string, MibDefinition>();
+            var lines = content.Split('\n');
+            var currentDef = new MibDefinition();
+            var moduleIdentity = "";
+            var inImports = false;
+            var importedOids = new HashSet<string>();
+
+            // Pierwszy przebieg - szukamy IMPORTS i MODULE-IDENTITY
+            foreach (var line in lines)
             {
-                foreach (var node in module.Nodes.Values)
+                var trimmedLine = line.Trim();
+                if (string.IsNullOrWhiteSpace(trimmedLine) || trimmedLine.StartsWith("--"))
+                    continue;
+
+                if (trimmedLine == "IMPORTS")
                 {
-                    if (string.IsNullOrEmpty(node.Oid))
-                        continue;
+                    inImports = true;
+                    continue;
+                }
 
-                    var parts = node.Oid.Split('.');
-                    MibNode? currentParent = null;
-
-                    foreach (var part in parts)
+                if (inImports)
+                {
+                    if (trimmedLine.EndsWith(";"))
                     {
-                        var trimmedPart = part.Trim();
-                        if (module.Nodes.TryGetValue(trimmedPart, out var foundNode))
-                        {
-                            currentParent = foundNode;
-                        }
-                        else if (int.TryParse(trimmedPart, out _))
-                        {
-                            // Numeric OID part
-                            continue;
-                        }
-                        else
-                        {
-                            // Try to find node in other modules
-                            var found = false;
-                            foreach (var otherModule in _modules.Values)
-                            {
-                                if (otherModule.Nodes.TryGetValue(trimmedPart, out foundNode))
-                                {
-                                    currentParent = foundNode;
-                                    found = true;
-                                    break;
-                                }
-                            }
+                        inImports = false;
+                        continue;
+                    }
 
-                            if (!found)
+                    // Zbieramy importowane nazwy aż do FROM
+                    if (!trimmedLine.Contains("FROM"))
+                    {
+                        foreach (var name in trimmedLine.Split(','))
+                        {
+                            var cleanName = name.Trim();
+                            if (!string.IsNullOrEmpty(cleanName))
                             {
-                                // Create placeholder node
-                                currentParent = new MibNode(trimmedPart);
-                                module.Nodes[trimmedPart] = currentParent;
+                                importedOids.Add(cleanName);
+                                // Jeśli importowany OID jest w bazie znanych OID-ów, dodajemy go do mapy
+                                if (_smiOids.ContainsKey(cleanName))
+                                {
+                                    oidMap[cleanName] = _smiOids[cleanName];
+                                }
                             }
                         }
                     }
-
-                    if (currentParent != null && currentParent != node)
+                    else
                     {
-                        node.Parent = currentParent;
-                        currentParent.Children[node.Name] = node;
+                        var parts = trimmedLine.Split(new[] { "FROM" }, StringSplitOptions.RemoveEmptyEntries);
+                        if (parts.Length > 0)
+                        {
+                            var importedNames = parts[0];
+                            foreach (var name in importedNames.Split(','))
+                            {
+                                var cleanName = name.Trim();
+                                if (!string.IsNullOrEmpty(cleanName))
+                                {
+                                    importedOids.Add(cleanName);
+                                    // Jeśli importowany OID jest w bazie znanych OID-ów, dodajemy go do mapy
+                                    if (_smiOids.ContainsKey(cleanName))
+                                    {
+                                        oidMap[cleanName] = _smiOids[cleanName];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                if (trimmedLine.EndsWith("MODULE-IDENTITY"))
+                {
+                    moduleIdentity = trimmedLine.Split(' ')[0];
+                }
+                else if (!string.IsNullOrEmpty(moduleIdentity) && trimmedLine.StartsWith("::=") && trimmedLine.Contains("{") && importedOids.Contains("enterprises"))
+                {
+                    var parts = trimmedLine.Split(new[] { '{', '}' }, StringSplitOptions.RemoveEmptyEntries);
+                    if (parts.Length >= 2)
+                    {
+                        var definition = parts[1].Trim().Split(' ');
+                        if (definition.Length >= 2 && definition[0].Trim() == "enterprises")
+                        {
+                            var enterpriseId = definition[1].Trim();
+                            oidMap[moduleIdentity] = oidMap["enterprises"] + "." + enterpriseId;
+                        }
                     }
                 }
             }
+
+            // Drugi przebieg - zbieramy wszystkie definicje
+            foreach (var line in lines)
+            {
+                var trimmedLine = line.Trim();
+                if (string.IsNullOrWhiteSpace(trimmedLine) || trimmedLine.StartsWith("--"))
+                    continue;
+
+                if (trimmedLine.Contains("OBJECT IDENTIFIER") && trimmedLine.Contains("::="))
+                {
+                    var name = trimmedLine.Split(new[] { "OBJECT", "IDENTIFIER", "::=" }, StringSplitOptions.RemoveEmptyEntries)[0].Trim();
+                    var parts = trimmedLine.Split(new[] { "::=" }, StringSplitOptions.RemoveEmptyEntries);
+                    if (parts.Length >= 2)
+                    {
+                        var value = parts[1].Trim();
+                        // Sprawdzamy czy to bezpośredni OID (np. "1.3.6.1.4.1.55108")
+                        if (!value.Contains("{") && value.All(c => char.IsDigit(c) || c == '.'))
+                        {
+                            oidMap[name] = value.TrimStart('.');
+                        }
+                        // Sprawdzamy czy to referencja z indeksem (np. "enterprises.55108")
+                        else if (!value.Contains("{") && value.Contains("."))
+                        {
+                            var refParts = value.Split('.');
+                            if (refParts.Length >= 2 && oidMap.ContainsKey(refParts[0]))
+                            {
+                                var baseOid = oidMap[refParts[0]];
+                                var index = string.Join(".", refParts.Skip(1));
+                                oidMap[name] = baseOid + "." + index;
+                            }
+                        }
+                        // Sprawdzamy czy to referencja do innego OID-a (np. "mgmt")
+                        else if (!value.Contains("{") && !value.Contains(" "))
+                        {
+                            var refName = value.Trim();
+                            if (oidMap.ContainsKey(refName))
+                            {
+                                oidMap[name] = oidMap[refName];
+                            }
+                        }
+                        // Jeśli to definicja z klamrami (np. "{ enterprises 55108 }")
+                        else if (value.Contains("{"))
+                        {
+                            var bracketParts = value.Split(new[] { '{', '}' }, StringSplitOptions.RemoveEmptyEntries);
+                            if (bracketParts.Length >= 1)
+                            {
+                                var definition = bracketParts[0].Trim().Split(' ');
+                                if (definition.Length >= 2)
+                                {
+                                    var parent = definition[0].Trim();
+                                    var index = definition[1].Trim();
+                                    definitions[name] = new MibDefinition { Name = name, Parent = parent, Index = index };
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                if (trimmedLine.EndsWith("OBJECT-TYPE"))
+                {
+                    if (!string.IsNullOrEmpty(currentDef.Name))
+                    {
+                        definitions[currentDef.Name] = currentDef;
+                    }
+                    currentDef = new MibDefinition { Name = trimmedLine.Split(' ')[0] };
+                    continue;
+                }
+
+                if (trimmedLine.StartsWith("::="))
+                {
+                    var value = trimmedLine.Substring(3).Trim();
+                    // Sprawdzamy czy to bezpośredni OID (np. "1.3.6.1.4.1.55108.2")
+                    if (!value.Contains("{") && value.All(c => char.IsDigit(c) || c == '.'))
+                    {
+                        oidMap[currentDef.Name] = value.TrimStart('.');
+                    }
+                    // Sprawdzamy czy to referencja z indeksem (np. "enterprises.55108")
+                    else if (!value.Contains("{") && value.Contains("."))
+                    {
+                        var refParts = value.Split('.');
+                        if (refParts.Length >= 2 && oidMap.ContainsKey(refParts[0]))
+                        {
+                            var baseOid = oidMap[refParts[0]];
+                            var index = string.Join(".", refParts.Skip(1));
+                            oidMap[currentDef.Name] = baseOid + "." + index;
+                        }
+                    }
+                    // Sprawdzamy czy to referencja do innego OID-a (np. "mgmt")
+                    else if (!value.Contains("{") && !value.Contains(" "))
+                    {
+                        var refName = value.Trim();
+                        if (oidMap.ContainsKey(refName))
+                        {
+                            oidMap[currentDef.Name] = oidMap[refName];
+                        }
+                    }
+                    // Jeśli to definicja z klamrami (np. "{ enterprises 55108 }")
+                    else if (value.Contains("{"))
+                    {
+                        var oidParts = value.Split(new[] { '{', '}' }, StringSplitOptions.RemoveEmptyEntries);
+                        if (oidParts.Length > 0)
+                        {
+                            var oidDefinition = oidParts[0].Trim().Split(' ');
+                            if (oidDefinition.Length >= 2)
+                            {
+                                currentDef.Parent = oidDefinition[0].Trim();
+                                currentDef.Index = oidDefinition[1].Trim();
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                if (trimmedLine.StartsWith("SYNTAX"))
+                    currentDef.Attributes["SYNTAX"] = ExtractValue(trimmedLine, "SYNTAX");
+                else if (trimmedLine.StartsWith("ACCESS") || trimmedLine.StartsWith("MAX-ACCESS"))
+                    currentDef.Attributes["ACCESS"] = ExtractValue(trimmedLine, trimmedLine.StartsWith("ACCESS") ? "ACCESS" : "MAX-ACCESS");
+                else if (trimmedLine.StartsWith("STATUS"))
+                    currentDef.Attributes["STATUS"] = ExtractValue(trimmedLine, "STATUS");
+                else if (trimmedLine.StartsWith("DESCRIPTION"))
+                    currentDef.Attributes["DESCRIPTION"] = ExtractQuotedValue(trimmedLine, content, ref lines);
+                else if (trimmedLine.StartsWith("UNITS"))
+                    currentDef.Attributes["UNITS"] = ExtractQuotedValue(trimmedLine, content, ref lines);
+            }
+
+            if (!string.IsNullOrEmpty(currentDef.Name))
+            {
+                definitions[currentDef.Name] = currentDef;
+            }
+
+            // Czwarty przebieg - budujemy zmienne
+            var variables = new List<MibVariable>();
+
+            // Najpierw dodajemy zmienne z bezpośrednimi OID-ami
+            foreach (var def in definitions.Values)
+            {
+                if (oidMap.TryGetValue(def.Name, out var directOid))
+                {
+                    variables.Add(CreateMibVariable(def, directOid));
+                }
+                else
+                {
+                    var fullOid = BuildFullOid(def, oidMap, definitions);
+                    if (!string.IsNullOrEmpty(fullOid))
+                    {
+                        variables.Add(CreateMibVariable(def, fullOid));
+                    }
+                }
+            }
+
+            return variables.OrderBy(v => v.FullOid).ToList();
         }
 
-        public void PrintTree(MibNode node, int level = 0)
+        private string BuildFullOid(MibDefinition def, Dictionary<string, string> oidMap, Dictionary<string, MibDefinition> definitions, HashSet<string> visited = null)
         {
-            var indent = new string(' ', level * 2);
-            Console.WriteLine($"{indent}{node.Name} ({node.GetFullOid()})");
-            
-            if (!string.IsNullOrEmpty(node.Syntax))
-                Console.WriteLine($"{indent}  Syntax: {node.Syntax}");
-            if (!string.IsNullOrEmpty(node.Access))
-                Console.WriteLine($"{indent}  Access: {node.Access}");
-            if (!string.IsNullOrEmpty(node.Status))
-                Console.WriteLine($"{indent}  Status: {node.Status}");
-            if (!string.IsNullOrEmpty(node.Description))
-                Console.WriteLine($"{indent}  Description: {node.Description}");
+            if (string.IsNullOrEmpty(def.Parent) || string.IsNullOrEmpty(def.Index))
+                return null;
 
-            foreach (var child in node.Children.Values)
-                PrintTree(child, level + 1);
+            visited ??= new HashSet<string>();
+
+            // Wykrywanie cykli
+            if (!visited.Add(def.Name))
+                return null;
+
+            // Jeśli już mamy obliczony OID dla tego węzła, zwracamy go
+            if (oidMap.TryGetValue(def.Name, out var existingOid))
+                return existingOid;
+
+            // Jeśli parent jest w bazie znanych OID-ów
+            if (oidMap.TryGetValue(def.Parent, out var parentOid))
+            {
+                var fullOid = parentOid + "." + def.Index;
+                oidMap[def.Name] = fullOid;
+                return fullOid;
+            }
+
+            // Jeśli parent jest w definicjach, rekurencyjnie budujemy jego OID
+            if (definitions.TryGetValue(def.Parent, out var parentDef))
+            {
+                var parentOidStr = BuildFullOid(parentDef, oidMap, definitions, visited);
+                if (!string.IsNullOrEmpty(parentOidStr))
+                {
+                    var fullOid = parentOidStr + "." + def.Index;
+                    oidMap[def.Name] = fullOid;
+                    return fullOid;
+                }
+            }
+
+            return null;
         }
-    }
 
-    public class MibParseException : Exception
-    {
-        public MibParseException(string message) : base(message) { }
-        public MibParseException(string message, Exception innerException) : base(message, innerException) { }
+        private MibVariable CreateMibVariable(MibDefinition def, string fullOid)
+        {
+            var type = def.Attributes.GetValueOrDefault("SYNTAX", "Unknown");
+            var variable = new MibVariable(def.Name, "." + fullOid, type)
+            {
+                Access = def.Attributes.GetValueOrDefault("ACCESS"),
+                Status = def.Attributes.GetValueOrDefault("STATUS"),
+                Description = def.Attributes.GetValueOrDefault("DESCRIPTION"),
+                Units = def.Attributes.GetValueOrDefault("UNITS")
+            };
+
+            // Sprawdzamy czy SYNTAX zawiera wartości enum
+            if (type.Contains("{"))
+            {
+                var enumStart = type.IndexOf('{');
+                var enumEnd = type.LastIndexOf('}');
+                if (enumStart != -1 && enumEnd != -1)
+                {
+                    var enumContent = type.Substring(enumStart + 1, enumEnd - enumStart - 1);
+                    var enumPairs = enumContent.Split(',');
+                    foreach (var pair in enumPairs)
+                    {
+                        var match = System.Text.RegularExpressions.Regex.Match(pair.Trim(), @"(\w+)\s*\((\d+)\)");
+                        if (match.Success)
+                        {
+                            variable.EnumValues[match.Groups[2].Value] = match.Groups[1].Value;
+                        }
+                    }
+                }
+            }
+
+            return variable;
+        }
+
+        private string ExtractValue(string line, string keyword)
+        {
+            var value = line.Substring(keyword.Length).Trim();
+            return value.TrimEnd(new[] { ' ', '\t', '\r', '\n', ',' });
+        }
+
+        private string ExtractQuotedValue(string firstLine, string fullContent, ref string[] lines)
+        {
+            var startQuote = firstLine.IndexOf('"');
+            if (startQuote == -1) return "";
+
+            var value = firstLine.Substring(startQuote + 1);
+            if (value.EndsWith("\""))
+                return value.TrimEnd('"');
+
+            var sb = new StringBuilder(value);
+            var currentLineIndex = Array.IndexOf(lines, firstLine) + 1;
+
+            while (currentLineIndex < lines.Length)
+            {
+                var line = lines[currentLineIndex].Trim();
+                if (line.EndsWith("\""))
+                {
+                    sb.Append(" ").Append(line.TrimEnd('"'));
+                    break;
+                }
+                sb.Append(" ").Append(line);
+                currentLineIndex++;
+            }
+
+            return sb.ToString();
+        }
+
+        public List<MibVariable> ParseFile(string filePath)
+        {
+            var content = File.ReadAllText(filePath);
+            return ParseString(content);
+        }
     }
 }
